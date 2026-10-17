@@ -7,6 +7,7 @@ memicu cooldown, dan fetch selama cooldown TIDAK menyentuh jaringan.
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import time
 
@@ -27,6 +28,14 @@ from core.fetch import (  # noqa: E402
 )
 
 CFG = load_config(os.path.join(os.path.dirname(__file__), "..", "config.yaml"))
+
+def fresh_tmp(name: str) -> str:
+    """Dir uji yang selalu bersih (idempotent antar-run & antar-test-file)."""
+    path = os.path.join("/tmp", name)
+    shutil.rmtree(path, ignore_errors=True)
+    os.makedirs(path, exist_ok=True)
+    return path
+
 
 
 def make_ohlcv(n: int = 50, start: float = 1_700_000_000_000) -> list:
@@ -53,7 +62,7 @@ class MockExchange:
 
 
 # ---------------------------------------------------------------- cache tests
-def test_cache_miss_hit_stale(tmpdir="/tmp/wp3_cache"):
+def test_cache_miss_hit_stale(tmpdir=fresh_tmp("wp3_cache")):
     c = ParquetCache(tmpdir)
     r = c.get("indodax", "BTC/IDR", "1h", ttl_seconds=3600)
     assert r.status == STATUS_MISS and r.df is None
@@ -69,7 +78,7 @@ def test_cache_miss_hit_stale(tmpdir="/tmp/wp3_cache"):
     assert r2.status == STATUS_STALE and r2.df is not None
 
 
-def test_cache_truncates_and_sanitizes(tmpdir="/tmp/wp3_cache2"):
+def test_cache_truncates_and_sanitizes(tmpdir=fresh_tmp("wp3_cache2")):
     c = ParquetCache(tmpdir)
     df = pd.DataFrame(make_ohlcv(400), columns=["ts", "open", "high", "low", "close", "volume"])
     c.put("indodax", "ETH/IDR", "4h", df, max_candles=300)
@@ -79,7 +88,7 @@ def test_cache_truncates_and_sanitizes(tmpdir="/tmp/wp3_cache2"):
     assert len(got.df) == 300  # tail(max_candles)
 
 
-def test_cache_corrupt_file_is_miss(tmpdir="/tmp/wp3_cache3"):
+def test_cache_corrupt_file_is_miss(tmpdir=fresh_tmp("wp3_cache3")):
     c = ParquetCache(tmpdir)
     path = c.key_path("indodax", "X/IDR", "1d")
     with open(path, "w") as fh:
@@ -88,7 +97,7 @@ def test_cache_corrupt_file_is_miss(tmpdir="/tmp/wp3_cache3"):
     assert r.status == STATUS_MISS
 
 
-def test_cache_flush(tmpdir="/tmp/wp3_cache4"):
+def test_cache_flush(tmpdir=fresh_tmp("wp3_cache4")):
     c = ParquetCache(tmpdir)
     df = pd.DataFrame(make_ohlcv(5), columns=["ts", "open", "high", "low", "close", "volume"])
     c.put("indodax", "A/IDR", "1h", df)
@@ -133,7 +142,7 @@ def _fetcher(tmpdir, exchange):
     return f
 
 
-def test_fetch_network_then_cache_hit(tmpdir="/tmp/wp3_fetch1"):
+def test_fetch_network_then_cache_hit(tmpdir=fresh_tmp("wp3_fetch1")):
     ex = MockExchange()
     f = _fetcher(tmpdir, ex)
     r = f.fetch_ohlcv("BTC/IDR", "1h", limit=30)
@@ -144,7 +153,7 @@ def test_fetch_network_then_cache_hit(tmpdir="/tmp/wp3_fetch1"):
     assert r2.source == SOURCE_CACHE and ex.calls == 1   # level 1: tanpa jaringan
 
 
-def test_fetch_fallback_stale_on_network_error(tmpdir="/tmp/wp3_fetch2"):
+def test_fetch_fallback_stale_on_network_error(tmpdir=fresh_tmp("wp3_fetch2")):
     import ccxt
     good = MockExchange()
     f = _fetcher(tmpdir, good)
@@ -161,7 +170,7 @@ def test_fetch_fallback_stale_on_network_error(tmpdir="/tmp/wp3_fetch2"):
     assert any("Network gagal" in w for w in r.warnings)
 
 
-def test_fetch_triggers_cooldown_after_3_failures(tmpdir="/tmp/wp3_fetch3"):
+def test_fetch_triggers_cooldown_after_3_failures(tmpdir=fresh_tmp("wp3_fetch3")):
     """Resilience drill §6.2: 3x gagal beruntun -> cooldown, no network calls."""
     import ccxt
     f = _fetcher(tmpdir, MockExchange(fail_with=ccxt.RequestTimeout("timeout")))
@@ -190,7 +199,7 @@ def test_fetch_triggers_cooldown_after_3_failures(tmpdir="/tmp/wp3_fetch3"):
     assert st["in_cooldown"] and st["trigger_count"] == 1
 
 
-def test_fetch_cooldown_returns_stale_cache(tmpdir="/tmp/wp3_fetch4"):
+def test_fetch_cooldown_returns_stale_cache(tmpdir=fresh_tmp("wp3_fetch4")):
     import ccxt
     ok = MockExchange()
     f = _fetcher(tmpdir, ok)
@@ -208,7 +217,7 @@ def test_fetch_cooldown_returns_stale_cache(tmpdir="/tmp/wp3_fetch4"):
     assert "circuit breaker" in r.warnings[0].lower() or "API_COOLDOWN" in r.warnings[0]
 
 
-def test_client_side_error_not_counted(tmpdir="/tmp/wp3_fetch5"):
+def test_client_side_error_not_counted(tmpdir=fresh_tmp("wp3_fetch5")):
     import ccxt
     f = _fetcher(tmpdir, MockExchange(fail_with=ccxt.BadSymbol("no market")))
     try:
@@ -220,7 +229,7 @@ def test_client_side_error_not_counted(tmpdir="/tmp/wp3_fetch5"):
     assert not f.breaker.in_cooldown
 
 
-def test_invalid_timeframe_rejected(tmpdir="/tmp/wp3_fetch6"):
+def test_invalid_timeframe_rejected(tmpdir=fresh_tmp("wp3_fetch6")):
     from core.time_utils import TimeframeError
     f = _fetcher(tmpdir, MockExchange())
     try:
@@ -230,7 +239,7 @@ def test_invalid_timeframe_rejected(tmpdir="/tmp/wp3_fetch6"):
         pass
 
 
-def test_fetch_many_collects_results(tmpdir="/tmp/wp3_fetch7"):
+def test_fetch_many_collects_results(tmpdir=fresh_tmp("wp3_fetch7")):
     f = _fetcher(tmpdir, MockExchange())
     res = f.fetch_many(["A/IDR", "B/IDR"], "1h", limit=10)
     assert set(res) == {"A/IDR", "B/IDR"}
