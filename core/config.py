@@ -8,6 +8,7 @@ langsung dan tidak memakai magic number tersembunyi.
 from __future__ import annotations
 
 import copy
+import json
 import os
 from dataclasses import dataclass, field
 from typing import Any
@@ -23,14 +24,54 @@ class ConfigError(Exception):
 
 
 def _deep_merge(base: dict, override: dict) -> dict:
-    """Rekursif merge `override` ke `base` (mengembalikan salinan baru)."""
+    """Rekursif merge `override` ke `base` (mengembalikan salinan baru).
+
+    Nilai berprefix '@' diperlakukan sebagai literal string (untuk override
+    nilai yang memang berupa dict, mis. '@{"a": 1}').
+    """
     out = copy.deepcopy(base)
     for key, value in (override or {}).items():
-        if isinstance(value, dict) and isinstance(out.get(key), dict):
+        if isinstance(value, str) and value.startswith("@"):
+            # literal: coba parse sbg JSON, kalau gagal pakai teksnya apa adanya
+            try:
+                value = json.loads(value[1:])
+            except (ValueError, TypeError):
+                value = value[1:]
+            out[key] = value
+        elif isinstance(value, str) and "." in key:
+            # dotted key dalam override dict -> expand ke nested dict
+            parts = key.split(".")
+            node = out
+            for p in parts[:-1]:
+                nxt = node.get(p)
+                if not isinstance(nxt, dict):
+                    nxt = {}
+                    node[p] = nxt
+                node = nxt
+            node[parts[-1]] = _coerce_scalar(value)
+        elif isinstance(value, dict) and isinstance(out.get(key), dict):
             out[key] = _deep_merge(out[key], value)
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+def _coerce_scalar(s: str):
+    """Konversi string CLI -> int/float/bool bila mungkin; selain itu tetap str."""
+    low = s.lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if low in ("null", "none"):
+        return None
+    try:
+        return int(s)
+    except ValueError:
+        pass
+    try:
+        return float(s)
+    except ValueError:
+        pass
+    return s
 
 
 def _load_yaml(path: str) -> dict:

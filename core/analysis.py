@@ -97,15 +97,17 @@ def detect_conflicts(tf_results: dict[str, dict[str, Any]]) -> list[dict[str, An
     return conflicts
 
 
-def analyze_symbol(symbol: str, timeframes: list[str], fetcher, config,
+def analyze_symbol(symbol: str, timeframes: list[str], fetcher=None, config=None,
                    rr_mode: str = "auto", entry: Optional[float] = None,
                    stop: Optional[float] = None, target: Optional[float] = None,
-                   min_rr: float = 1.5) -> dict[str, Any]:
+                   min_rr: float = 1.5, exchange_id: Optional[str] = None,
+                   overrides: Optional[dict] = None) -> dict[str, Any]:
     """Analisa lengkap satu pair multi-TF. Return dict sesuai §4.1.
 
     Parameter:
-        fetcher : core.fetch.MarketDataFetcher (atau mock dgn interface sama)
-        config  : core.config.Config
+        fetcher : core.fetch.MarketDataFetcher (atau mock dgn interface sama).
+                  Jika None, dibuat otomatis dari `config` (+ `exchange_id`).
+        config  : core.config.Config; jika None dimuat dari config.yaml default
         rr_mode : auto | manual (manual butuh stop & target)
     """
     from .price_action import analyze_price_action
@@ -115,6 +117,15 @@ def analyze_symbol(symbol: str, timeframes: list[str], fetcher, config,
     from .trend import analyze_trend
     from .volume import analyze_volume
     from .warnings import evaluate, highest_severity
+
+    if config is None:
+        from .config import load_config
+        config = load_config(overrides=overrides)
+    if fetcher is None:
+        from .fetch import MarketDataFetcher
+        if exchange_id:
+            config.raw.setdefault("exchange", {})["id"] = exchange_id
+        fetcher = MarketDataFetcher(config)
 
     params = config.analysis
     tf_list = list(dict.fromkeys(timeframes))  # unik, jaga urutan

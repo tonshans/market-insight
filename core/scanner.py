@@ -59,6 +59,7 @@ class ScanOutcome:
     errors: dict[str, str]                # symbol -> pesan singkat
     cooldown_active: bool = False
     skipped_watchlist: bool = False
+    limit_reached_note: Optional[str] = None  # info bila --limit memotong kandidat
     duration_seconds: float = 0.0
     previous_ts: Optional[str] = None     # utk keterangan rank-change
     meta: dict[str, Any] = field(default_factory=dict)
@@ -275,7 +276,8 @@ def run_scan(fetcher, config, scanner_config, state=None,
              watchlist_only: bool = False,
              timeframes: Optional[list[str]] = None,
              progress: Optional[Callable[[int, int, str], None]] = None,
-             top_n: Optional[int] = None) -> ScanOutcome:
+             top_n: Optional[int] = None,
+             limit: Optional[int] = None) -> ScanOutcome:
     """Eksekusi scanner end-to-end (F3). Persistensi via `state` (opsional)."""
     import time as _t
     started = _t.time()
@@ -308,6 +310,15 @@ def run_scan(fetcher, config, scanner_config, state=None,
         fetcher, symbols, scfg, params, progress=progress)
     prefiltered_size = len(candidates)
     logger.info("lolos pre-filter ADX: %d/%d", prefiltered_size, universe_size)
+
+    # batas opsional jumlah analisa (hemat rate-limit / RPi) — urut qvol agar
+    # yang dipotong adalah kandidat paling tidak likuid
+    limit_reached_note = None
+    if limit is not None and 0 < limit < len(candidates):
+        candidates.sort(key=lambda s: qvol_map.get(s, 0.0), reverse=True)
+        limit_reached_note = (f"--limit {limit}: {len(candidates)} kandidat lolos "
+                              f"ADX, hanya {limit} teratas (likuiditas) yang dianalisa")
+        candidates = candidates[:limit]
 
     # 3+4. analisa & skor per kandidat ------------------------------------------
     rows: list[dict[str, Any]] = []
@@ -369,6 +380,7 @@ def run_scan(fetcher, config, scanner_config, state=None,
         prefiltered_size=prefiltered_size, analysed_size=len(rows),
         errors=errors, cooldown_active=cooldown_seen,
         skipped_watchlist=False, duration_seconds=round(_t.time() - started, 2),
+        limit_reached_note=limit_reached_note,
         previous_ts=prev_ts,
         meta={"timeframes": conf_tf, "prefilter_tf": scfg["prefilter"]["timeframe"],
               "min_adx": scfg["prefilter"]["min_adx"],

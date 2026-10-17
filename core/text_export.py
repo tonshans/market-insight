@@ -74,6 +74,8 @@ def render(result: dict[str, Any], level: int = 1, ansi: bool | None = None,
     # sumber data + umur (transparansi cache/cooldown)
     src_parts = []
     for tf, m in meta.items():
+        if not isinstance(m, dict):
+            continue  # toleransi entri non-per-TF mis. "warnings": [...]
         tag = {"cache": "cache", "network": "live",
                "fallback_stale": "STALE!", "cooldown_stale": "COOLDOWN!"}.get(
             m.get("source"), m.get("source"))
