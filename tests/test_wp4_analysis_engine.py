@@ -352,6 +352,62 @@ def test_warnings_rr_bad():
     assert any(w["code"] == "BAD_RR" and w["severity"] == "HIGH" for w in warns)
 
 
+# ---- regresi: TF_CONFLICT dgn bias CONFLICTED (string matching & hardcode) --
+def _tfres(direction):
+    return {"trend": {"label": "SIDEWAYS", "score_raw": 0.0, "votes": {}},
+            "risk": {"direction": direction}, "volume": {}, "price_action": {}}
+
+
+def test_warnings_conflicted_bias_counts_real_opposing_tfs():
+    """Bug lama: `"UP" in "CONFLICTED"` -> False sehingga semua TF LONG
+    dianggap berlawanan dan pesan hardcode `{opp}/3` salah utk jumlah TF."""
+    tf_results = {"1h": _tfres("LONG"), "4h": _tfres("SHORT"),
+                  "1d": _tfres("NEUTRAL")}
+    warns = warn_mod.evaluate(tf_results, summary_bias="CONFLICTED")
+    tc = [w for w in warns if w["code"] == "TF_CONFLICT"]
+    # 1 LONG vs 1 SHORT -> konflik nyata, tapi BUKAN 2/3 "berlawanan semu"
+    assert len(tc) == 1
+    assert "1 TF LONG vs 1 TF SHORT dari 3 TF" in tc[0]["message"]
+    assert "/3" not in tc[0]["message"].replace("dari 3 TF", "")
+
+    # dua LONG satu SHORT -> tetap konflik, denominasi jumlah TF benar
+    tf_results2 = {"1h": _tfres("LONG"), "4h": _tfres("LONG"),
+                   "1d": _tfres("SHORT"), "1w": _tfres("NEUTRAL")}
+    warns2 = warn_mod.evaluate(tf_results2, summary_bias="CONFLICTED")
+    tc2 = [w for w in warns2 if w["code"] == "TF_CONFLICT"]
+    assert len(tc2) == 1 and "2 TF LONG vs 1 TF SHORT dari 4 TF" in tc2[0]["message"]
+
+
+def test_warnings_aligned_bias_no_false_conflict():
+    """Bias UPTREND dengan semua TF LONG -> tidak boleh ada TF_CONFLICT
+    (bug lama: arah dihitung dari substring 'UP' yang rapuh)."""
+    tf_results = {"1h": _tfres("LONG"), "4h": _tfres("LONG"),
+                  "1d": _tfres("LONG")}
+    warns = warn_mod.evaluate(tf_results, summary_bias="UPTREND")
+    assert not [w for w in warns if w["code"] == "TF_CONFLICT"]
+
+    # Fixture lama KONTRADIKTIF: bias DOWNTREND dengan 2/3 TF SHORT berarti
+    # bias SEARAH dengan mayoritas TF (n_sup=2 > n_tf/2) -> bukan konflik,
+    # melainkan outlier NEUTRAL. Skenario konflik sejati: bias DOWNTREND
+    # tapi hanya 1/3 TF SHORT (mayoritas LONG berlawanan) -> konflik nyata
+    # dengan denominator dinamis "1/3 TF".
+    tf_results2 = {"1h": _tfres("LONG"), "4h": _tfres("LONG"),
+                   "1d": _tfres("SHORT")}
+    warns2 = warn_mod.evaluate(tf_results2, summary_bias="DOWNTREND")
+    tc = [w for w in warns2 if w["code"] == "TF_CONFLICT"]
+    # pesan melaporkan jumlah TF BERLAWANAN (2 LONG) dari denominator dinamis 3
+    assert len(tc) == 1 and "2/3 TF" in tc[0]["message"]
+
+    # Tambahan: kasus fixture lama (2 SHORT + 1 NEUTRAL, bias DOWNTREND)
+    # justru TIDAK boleh memicu konflik — dukungan mayoritas ketat (2/3),
+    # sisanya netral (bukan oposisi). Ini menjaga perbaikan bug lama di mana
+    # `d != expected` menghitung TF NEUTRAL sebagai "berlawanan".
+    tf_results3 = {"1h": _tfres("SHORT"), "4h": _tfres("SHORT"),
+                   "1d": _tfres("NEUTRAL")}
+    warns3 = warn_mod.evaluate(tf_results3, summary_bias="DOWNTREND")
+    assert not [w for w in warns3 if w["code"] == "TF_CONFLICT"]
+
+
 ALL_TESTS = [v for k, v in sorted(globals().items())
              if k.startswith("test_") and isinstance(v, types.FunctionType)]
 

@@ -26,6 +26,7 @@ from typing import Any, Optional
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS scan_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
+    scan_id INTEGER,
     ts_utc TEXT NOT NULL,
     symbol TEXT NOT NULL,
     rank INTEGER,
@@ -35,12 +36,33 @@ CREATE TABLE IF NOT EXISTS scan_history (
     raw_scores_json TEXT -- dump raw scores utk Fase 2 (D-3)
 );
 CREATE INDEX IF NOT EXISTS idx_symbol_ts ON scan_history(symbol, ts_utc);
+CREATE INDEX IF NOT EXISTS idx_scan_id ON scan_history(scan_id);
 
 CREATE TABLE IF NOT EXISTS bot_state (
     key TEXT PRIMARY KEY,
     value TEXT
 );
 """
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Migrasi ringan DB lama (tanpa kolom scan_id) -> tambah kolom + backfill.
+
+    Baris lama di-backfill per kelompok ts_utc dengan urutan insertion
+    (MIN(rowid)) sehingga get_last_scan/compare_rank tetap benar pada DB
+    existing; tiap pemanggilan save_scan_result berikutnya mendapat scan_id
+    baru sendiri.
+    """
+    cols = {r["name"] for r in conn.execute("PRAGMA table_info(scan_history)")}
+    if "scan_id" not in cols:
+        conn.execute("ALTER TABLE scan_history ADD COLUMN scan_id INTEGER")
+        rows = conn.execute(
+            "SELECT ts_utc FROM scan_history GROUP BY ts_utc"
+            " ORDER BY MIN(rowid)").fetchall()
+        for i, r in enumerate(rows, start=1):
+            conn.execute(
+                "UPDATE scan_history SET scan_id=? WHERE ts_utc=?",
+                (i, r["ts_utc"]))
 
 
 def _json_safe(v: Any) -> Any:
@@ -75,6 +97,7 @@ class StateStore:
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA synchronous=NORMAL;")
             conn.executescript(_SCHEMA)
+            _migrate(conn)
 
     # ------------------------------------------------------- scan history
     def save_scan_result(self, ts_utc: str, rows: list[dict[str, Any]]) -> int:
@@ -82,39 +105,59 @@ class StateStore:
 
         Row minimal berisi: symbol; opsional rank/prospect/risk/adj_score
         dan field apa pun yang akan di-dump ke raw_scores_json (D-3).
+
+        Semua baris dalam satu pemanggilan diberi `scan_id` yang sama
+        (AUTOINCREMENT per INSERT pertama) sehingga batas antar-scan tidak
+        bergantung pada keunikan string ts_utc — dua scan dalam detik yang
+        sama tetap terpisah dengan benar.
         """
         if not rows:
             return 0
-        payload = []
-        for r in rows:
-            raw = {k: v for k, v in r.items()
-                   if k not in ("symbol", "rank", "prospect", "risk", "adj_score")}
-            payload.append((
-                ts_utc,
-                str(r["symbol"]),
-                int(r["rank"]) if r.get("rank") is not None else None,
-                float(r["prospect"]) if r.get("prospect") is not None else None,
-                float(r["risk"]) if r.get("risk") is not None else None,
-                float(r["adj_score"]) if r.get("adj_score") is not None else None,
-                json.dumps(_json_safe(raw), default=str, allow_nan=False),
-            ))
         with self._connect() as conn:
+            # scan_id bersama utk batch ini
+            sid = conn.execute(
+                "SELECT COALESCE(MAX(scan_id), 0) + 1 FROM scan_history"
+            ).fetchone()[0]
+            payload = []
+            for r in rows:
+                raw = {k: v for k, v in r.items()
+                       if k not in ("symbol", "rank", "prospect", "risk",
+                                    "adj_score")}
+                payload.append((
+                    sid,
+                    ts_utc,
+                    str(r["symbol"]),
+                    int(r["rank"]) if r.get("rank") is not None else None,
+                    float(r["prospect"]) if r.get("prospect") is not None else None,
+                    float(r["risk"]) if r.get("risk") is not None else None,
+                    float(r["adj_score"]) if r.get("adj_score") is not None else None,
+                    json.dumps(_json_safe(raw), default=str, allow_nan=False),
+                ))
             conn.executemany(
-                "INSERT INTO scan_history (ts_utc, symbol, rank, prospect, risk,"
-                " adj_score, raw_scores_json) VALUES (?,?,?,?,?,?,?)", payload)
+                "INSERT INTO scan_history (scan_id, ts_utc, symbol, rank,"
+                " prospect, risk, adj_score, raw_scores_json)"
+                " VALUES (?,?,?,?,?,?,?,?)", payload)
         return len(payload)
 
     def get_last_scan(self) -> Optional[dict[str, Any]]:
-        """Ambil hasil scan terakhir sebagai {ts_utc, rows:[...]} atau None."""
+        """Ambil hasil scan terakhir sebagai {ts_utc, rows:[...]} atau None.
+
+        Batas "scan" ditentukan dari kolom `scan_id` (satu nilai per
+        pemanggilan save_scan_result), BUKAN dari string ts_utc: dua scan
+        dalam detik yang sama (ts identik, mis. scan cepat berurutan) tetap
+        terpisah — sorting string akan menumpuk baris keduanya menjadi satu
+        "scan" dan merusak perbandingan rank.
+        """
         with self._connect() as conn:
             row = conn.execute(
-                "SELECT MAX(ts_utc) AS ts FROM scan_history").fetchone()
-            if not row or row["ts"] is None:
+                "SELECT scan_id, ts_utc FROM scan_history"
+                " ORDER BY scan_id DESC LIMIT 1").fetchone()
+            if not row or row["scan_id"] is None:
                 return None
-            ts = row["ts"]
+            sid, ts = row["scan_id"], row["ts_utc"]
             rows = conn.execute(
-                "SELECT * FROM scan_history WHERE ts_utc = ? ORDER BY rank ASC",
-                (ts,)).fetchall()
+                "SELECT * FROM scan_history WHERE scan_id = ? ORDER BY rank ASC",
+                (sid,)).fetchall()
         out = []
         for r in rows:
             d = dict(r)
@@ -136,30 +179,48 @@ class StateStore:
     def compare_rank(self, symbol: str) -> Optional[dict[str, Any]]:
         """Bandingkan rank simbol pada scan terakhir vs scan sebelumnya (F3).
 
-        Return None bila data belum dua kali; jika simbol absen di salah satu
-        scan, rank-nya None (diinterpretasikan caller sbg ENTERED/EXITED).
+        Return None bila data belum dua kali. Semantik status dibuat EKSPLISIT
+        agar konsisten dengan `rank_change` di core/scanner.py:
+            - hadir di keduanya      -> status "MOVED"/"HOLD", delta terisi
+            - hanya di scan terakhir -> status "ENTERED", delta None
+            - hanya di scan awal     -> status "EXITED", delta None
+            - tidak ada di keduanya  -> status "ABSENT"
+
+        Penentuan "scan terakhir vs sebelumnya" memakai `scan_id` (satu nilai
+        per pemanggilan save_scan_result), bukan string ts: dua scan dalam
+        detik yang sama tetap punya urutan benar dan tidak tertukar/tergabung
+        oleh sorting string.
         """
         with self._connect() as conn:
             scans = conn.execute(
-                "SELECT DISTINCT ts_utc FROM scan_history"
-                " ORDER BY ts_utc DESC LIMIT 2").fetchall()
+                "SELECT scan_id, MAX(ts_utc) AS ts FROM scan_history"
+                " GROUP BY scan_id ORDER BY scan_id DESC LIMIT 2").fetchall()
         if len(scans) < 2:
             return None
-        cur_ts, prev_ts = scans[0]["ts_utc"], scans[1]["ts_utc"]
+        cur_sid, prev_sid = scans[0]["scan_id"], scans[1]["scan_id"]
+        cur_ts, prev_ts = scans[0]["ts"], scans[1]["ts"]
 
-        def _rank_at(ts: str) -> Optional[int]:
+        def _rank_at(sid: int) -> Optional[int]:
             with self._connect() as conn:
                 r = conn.execute(
-                    "SELECT rank FROM scan_history WHERE ts_utc=? AND symbol=?",
-                    (ts, symbol)).fetchone()
+                    "SELECT rank FROM scan_history WHERE scan_id=? AND symbol=?",
+                    (sid, symbol)).fetchone()
             return None if r is None else r["rank"]
 
-        cur, prev = _rank_at(cur_ts), _rank_at(prev_ts)
+        cur, prev = _rank_at(cur_sid), _rank_at(prev_sid)
         delta = None
         if cur is not None and prev is not None:
-            delta = prev - cur  # positif = naik peringkat
+            delta = prev - cur  # positif = naik peringkat (konsisten scanner)
+            status = "HOLD" if delta == 0 else "MOVED"
+        elif cur is not None:
+            status = "ENTERED"
+        elif prev is not None:
+            status = "EXITED"
+        else:
+            status = "ABSENT"
         return {"symbol": symbol, "current_rank": cur, "previous_rank": prev,
-                "delta": delta, "current_ts": cur_ts, "previous_ts": prev_ts}
+                "delta": delta, "status": status,
+                "current_ts": cur_ts, "previous_ts": prev_ts}
 
     # ---------------------------------------------------------- bot state
     def set_bot_state(self, key: str, value: Any) -> None:

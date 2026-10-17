@@ -101,16 +101,62 @@ def evaluate(tf_results: dict[str, dict[str, Any]],
                             "position sizing harus diperkecil."))
 
     # ---- confluence-level (summary) -----------------------------------------
-    if summary_bias:
+    if summary_bias and tf_results:
         dirs = [r.get("risk", {}).get("direction", "NEUTRAL")
                 for r in tf_results.values()]
-        opp = sum(1 for d in dirs
-                  if d != "NEUTRAL" and d != ("LONG" if "UP" in summary_bias
-                                              else "SHORT"))
-        if opp >= 2:
-            warns.append(_w("TF_CONFLICT", "HIGH",
-                            f"Bias {summary_bias} tapi {opp}/3 TF berlawanan; "
-                            "hanya observasi, bukan setup."))
+        n_tf = len(dirs)
+        # Arah bias ditentukan EKSPLISIT dari nilai canonical label confluence
+        # ("UP"/"DOWN"/"UPTREND"/"DOWNTREND"/"SIDEWAYS"/"CONFLICTED"), BUKAN
+        # substring matching yang rapuh (bug lama: `"UP" in "CONFLICTED"` dsb).
+        bias_norm = str(summary_bias).strip().upper()
+        bias_up = bias_norm in ("UP", "UPTREND")
+        bias_down = bias_norm in ("DOWN", "DOWNTREND")
+        if bias_up or bias_down:
+            # Bug inti yang diperbaiki di sini: deteksi konflik dihitung dari
+            # FRAKSI TF yang SEARAH dengan bias, bukan dari string matching
+            # arah bias dan bukan dari perbandingan `d != expected` yang
+            # menjadikan semua TF NEUTRAL sebagai "berlawanan".
+            #   n_sup / n_tf  -> fraksi TF yang benar-benar mendukung bias
+            # Konflik nyata bila mayoritas kecil (<= ambang MINORITY, selaras
+            # core/analysis.py) atau nol TF yang mendukung bias:
+            #   - n_sup == 0                  -> tidak ada dukungan sama sekali
+            #   - n_sup * 3 <= n_tf           -> < ~1/3 TF searah (MINORITY)
+            # Pesan memakai denominator DINAMIS `n_tf` (bukan hardcode "/3")
+            # dan menghitung hanya TF berlawanan-arah (LONG vs SHORT); TF
+            # NEUTRAL dilaporkan terpisah agar tidak memicu "konflik semu".
+            supported = "LONG" if bias_up else "SHORT"
+            opposed = "SHORT" if bias_up else "LONG"
+            n_sup = dirs.count(supported)
+            n_opp = dirs.count(opposed)
+            # Ambang konflik berdenominator DINAMIS (bukan hardcode "/3"):
+            # dihitung dari fraksi TF yang SEARAH dengan bias (n_sup/n_tf).
+            # Konflik dilaporkan bila TF sejalan bukan mayoritas ketat
+            # (n_sup * 2 <= n_tf, termasuk kasus nol dukungan) dan ada
+            # oposisi nyata (n_opp >= 1). Ini menangkap dua mode kegagalan:
+            #   - arah berlawanan mendominasi/menyamai (mis. DOWNTREND tapi
+            #     hanya 0/3 TF SHORT sejalan);
+            #   - mayoritas semu karena banyak TF netral tanpa dukungan penuh.
+            # Sebaliknya, bias yang didukung mayoritas TF sejalan tidak boleh
+            # memicu konflik meski 1 TF berdiri sendiri di sisi berlawanan
+            # (itu sekadar outlier, bukan konflik confluence).
+            # TF NEUTRAL tidak pernah dihitung sebagai "berlawanan" (bug lama:
+            # `d != expected` membuat semua TF netral ikut dianggap konflik).
+            if n_sup * 2 <= n_tf and n_opp >= 1:
+                warns.append(_w(
+                    "TF_CONFLICT", "HIGH",
+                    f"Bias {summary_bias} tapi {n_opp}/{n_tf} TF "
+                    "berlawanan; hanya observasi, bukan setup."))
+        elif bias_norm == "CONFLICTED":
+            # konflik nyata antar TF: deteksi langsung dari arah, BUKAN dari
+            # string matching nama bias ("UP" in "CONFLICTED" -> False dulu
+            # membuat semua TF LONG dianggap berlawanan).
+            n_long = dirs.count("LONG")
+            n_short = dirs.count("SHORT")
+            if min(n_long, n_short) >= 1:
+                warns.append(_w("TF_CONFLICT", "HIGH",
+                                f"Bias {summary_bias}: {n_long} TF LONG vs "
+                                f"{n_short} TF SHORT dari {n_tf} TF; "
+                                "hanya observasi, bukan setup."))
 
     # ---- R:R global ------------------------------------------------------------
     if rr_summary and rr_summary.get("rr") is not None:

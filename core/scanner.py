@@ -52,7 +52,10 @@ def _clamp(v: float, lo: float = 0.0, hi: float = 1.0) -> float:
 class ScanOutcome:
     """Hasil satu scan penuh, siap render (CLI/bot) dan persist (SQLite)."""
     ts_utc: str
-    rows: list[dict[str, Any]]            # terurut, sudah dinomori `rank`
+    rows: list[dict[str, Any]]            # ranked (sudah dinomori `rank`),
+                                          # diikuti baris status "EXITED"
+                                          # (rank=None) bila ada yang keluar
+                                          # dari top-N vs scan sebelumnya
     universe_size: int
     prefiltered_size: int
     analysed_size: int
@@ -361,22 +364,51 @@ def run_scan(fetcher, config, scanner_config, state=None,
         prev_ts = last["ts_utc"] if last else None
         if prev_ts:
             prev_ranks = {r["symbol"]: r.get("rank") for r in last["rows"]}
+            cur_symbols = {r["symbol"] for r in display_rows}
             for r in display_rows:
                 pr = prev_ranks.get(r["symbol"])
                 r["prev_rank"] = pr
                 if pr is None:
+                    # muncul di scan ini tapi absen di scan sebelumnya
                     r["rank_change"] = "NEW"
+                    r["status"] = "ENTERED"
                 else:
-                    d = pr - r["rank"]
-                    r["rank_change"] = "0" if d == 0 else f"{'+' if d > 0 else ''}{d}"
+                    d = pr - r["rank"]  # positif = naik peringkat
                     r["rank_delta"] = d
+                    r["rank_change"] = "0" if d == 0 else f"{'+' if d > 0 else ''}{d}"
+                    r["status"] = "HOLD" if d == 0 else "MOVED"
+            # EXITED: ada di scan sebelumnya tapi hilang dari top-N scan ini.
+            # Tanpa penanda ini, informasi keluarnya simbol tidak pernah masuk
+            # ke pipeline (row Exit tidak ikut dipersist -> hilang total).
+            exited = [s for s in prev_ranks if s not in cur_symbols]
+            for i, s in enumerate(sorted(exited, key=lambda x: prev_ranks[x]), 1):
+                display_rows.append({
+                    "symbol": s,
+                    "rank": None,
+                    "prev_rank": prev_ranks[s],
+                    "rank_change": "EXITED",
+                    "status": "EXITED",
+                    "price": None, "qvol_24h": None,
+                    "trend_label": "SIDEWAYS", "adx": None, "rr": None,
+                    "prospect": None, "risk": None, "adj_score": None,
+                })
+            outcome_exited = exited
+        else:
+            outcome_exited = []
+    else:
+        outcome_exited = []
 
     ts = iso_utc()
     if state is not None and scfg["ranking"].get("persist_history", True):
-        state.save_scan_result(ts, display_rows)
+        # row EXITED punya rank=None (bukan bagian ranking scan ini) -> jangan
+        # dipersist ke scan_history agar `rank` tetap konsisten terisi untuk
+        # baris ranked & get_last_scan berikutnya tidak terpolusi.
+        persist_rows = [r for r in display_rows if r.get("rank") is not None]
+        state.save_scan_result(ts, persist_rows)
         state.set_bot_state("last_scan", {"ts_utc": ts,
                                           "n_candidates": prefiltered_size,
-                                          "n_universe": universe_size})
+                                          "n_universe": universe_size,
+                                          "exited": outcome_exited})
 
     return ScanOutcome(
         ts_utc=ts, rows=display_rows, universe_size=universe_size,
@@ -388,6 +420,7 @@ def run_scan(fetcher, config, scanner_config, state=None,
         meta={"timeframes": conf_tf, "prefilter_tf": scfg["prefilter"]["timeframe"],
               "min_adx": scfg["prefilter"]["min_adx"],
               "formula": scfg["ranking"].get("formula", ""),
+              "exited": outcome_exited,
               "persisted": bool(state is not None and
                                 scfg["ranking"].get("persist_history", True))},
     )
@@ -415,12 +448,20 @@ def format_scan_text(outcome: ScanOutcome, emoji: bool = True,
     lines.append(header)
     lines.append("-" * len(header))
     for r in outcome.rows:
+        if r.get("rank") is None:      # baris EXITED (dulu hilang dari pipeline)
+            continue
         delta = r.get("rank_change", "")
         rr = f"{r['rr']:.1f}" if r.get("rr") else "-"
         lines.append(
             f"{r['rank']:>2} {sym_icon(r['trend_label'])} {r['symbol']:<12} "
             f"{r['adj_score']:>6.1f} {r['prospect']:>6.1f} {r['risk']:>5.1f} "
             f"{r['trend_label']:<16} {r['adx']:>5.1f} {rr:>5} {delta:>4}")
+    exited = [r for r in outcome.rows if r.get("rank") is None]
+    if exited:
+        lines.append("")
+        lines.append("🚪 Keluar top-N sejak scan sebelumnya: " +
+                     ", ".join(f"{r['symbol']} (prev #{r['prev_rank']})"
+                               for r in exited))
     if outcome.cooldown_active:
         lines.append("")
         lines.append("⚠️ API_COOLDOWN aktif selama scan — sebagian data berasal "

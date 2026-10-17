@@ -94,9 +94,10 @@ class TestStateStore:
         idx = [r[1] for r in conn.execute("PRAGMA index_list(scan_history)")]
         bot_cols = [r[1] for r in conn.execute("PRAGMA table_info(bot_state)")]
         conn.close()
-        assert cols == ["id", "ts_utc", "symbol", "rank", "prospect", "risk",
-                        "adj_score", "raw_scores_json"]
+        assert cols == ["id", "scan_id", "ts_utc", "symbol", "rank", "prospect",
+                        "risk", "adj_score", "raw_scores_json"]
         assert "idx_symbol_ts" in idx
+        assert "idx_scan_id" in idx
         assert bot_cols == ["key", "value"]
 
     def test_save_and_get_last_scan_roundtrip(self, tmp_path):
@@ -129,9 +130,25 @@ class TestStateStore:
         cmp_a = st.compare_rank("A/IDR")
         assert cmp_a["current_rank"] == 1 and cmp_a["previous_rank"] == 3
         assert cmp_a["delta"] == 2                       # naik 2 peringkat
+        assert cmp_a["status"] == "MOVED"
         cmp_c = st.compare_rank("C/IDR")
         assert cmp_c["previous_rank"] is None and cmp_c["delta"] is None
-        assert st.compare_rank("Z/IDR")["current_rank"] is None
+        assert cmp_c["status"] == "ENTERED"
+        # B/IDR hilang dari scan terakhir -> penanda EXITED eksplisit
+        cmp_b = st.compare_rank("B/IDR")
+        assert cmp_b["current_rank"] is None and cmp_b["previous_rank"] == 1
+        assert cmp_b["delta"] is None and cmp_b["status"] == "EXITED"
+        z = st.compare_rank("Z/IDR")
+        assert z["current_rank"] is None and z["status"] == "ABSENT"
+
+    def test_compare_rank_hold_status(self, tmp_path):
+        st = StateStore(str(tmp_path / "mt.db"))
+        st.save_scan_result("2025-01-01T00:00:00+00:00",
+                            [{"symbol": "A/IDR", "rank": 2}])
+        st.save_scan_result("2025-01-02T00:00:00+00:00",
+                            [{"symbol": "A/IDR", "rank": 2}])
+        cmp_a = st.compare_rank("A/IDR")
+        assert cmp_a["delta"] == 0 and cmp_a["status"] == "HOLD"
 
     def test_compare_rank_single_scan_returns_none(self, tmp_path):
         st = StateStore(str(tmp_path / "mt.db"))
@@ -341,6 +358,51 @@ class TestRunScanEndToEnd:
                            "info": {"quote_volume": 4e9}}
         return MockFetcher(frames, markets=mk)
 
+    def _switching_fetcher(self, tmp_path):
+        """Scan #1: universe {BTC, ETH, XRP} -> top-3 memuat XRP.
+        Scan #2: XRP benar-benar DELISTED — hilang dari markets, frame, dan
+        cache — sehingga tidak muncul lagi sebagai kandidat. (Catatan: sekadar
+        `raise FetchError` TIDAK cukup; jalur produksi MarketDataFetcher
+        menjatuhkan kegagalan network ke stale-cache fallback, jadi simbol
+        tetap lolos prefilter.)"""
+        base_frames = _frames()
+        base_frames["XRP/IDR"] = {"4h": make_df("up", seed=11),
+                                  "1h": make_df("up", seed=12),
+                                  "1d": make_df("up", seed=13)}
+        mk = dict(MARKETS)
+        mk["XRP/IDR"] = {"active": True, "base": "XRP", "quote": "IDR",
+                         "info": {"quote_volume": 3e10}}
+
+        class SwitchingFetcher(MockFetcher):
+            """Mock dengan cache eksplisit (semirip level-1 fetch produksi)."""
+
+            def __init__(self):
+                super().__init__(base_frames, markets=mk)
+                self.cache = {}                 # (symbol, tf) -> df
+                for sym, tfs in base_frames.items():
+                    for tf, df in tfs.items():
+                        self.cache[(sym, tf)] = df
+
+            def set_scan(self, n):
+                self.scan_no = n
+                if n == 2:                      # simulasi delisting XRP
+                    self._markets.pop("XRP/IDR", None)
+                    self.frames.pop("XRP/IDR", None)
+                    for key in [k for k in self.cache if k[0] == "XRP/IDR"]:
+                        del self.cache[key]
+
+            def fetch_ohlcv(self, symbol, timeframe, limit=None,
+                            allow_stale_fallback=True):
+                self.calls.append((symbol, timeframe))
+                df = self.cache.get((symbol, timeframe))
+                if df is None:
+                    raise FetchError(f"no data {symbol} {timeframe}")
+                return FetchResult(symbol, timeframe, df, SOURCE_NETWORK)
+
+        f = SwitchingFetcher()
+        f.set_scan(1)
+        return f
+
     def test_full_flow_persist_and_rankchange(self, cfg, scfg, tmp_path):
         cfg.raw.setdefault("state", {})["db_path"] = str(tmp_path / "mt.db")
         st = open_state(cfg)
@@ -365,9 +427,51 @@ class TestRunScanEndToEnd:
         assert out2.previous_ts == out1.ts_utc
         for r in out2.rows:
             assert "prev_rank" in r and "rank_change" in r
+            if r.get("rank") is not None:      # baris ranked punya status selaras
+                assert r["status"] in ("ENTERED", "MOVED", "HOLD")
 
         # bot_state ikut ter-update
         assert st.get_bot_state("last_scan")["ts_utc"] == out2.ts_utc
+
+    def test_exited_marker_in_scan_pipeline(self, cfg, scfg, tmp_path):
+        """Regresi: simbol yang keluar dari top-N vs scan sebelumnya harus
+        mendapat penanda status EXITED (bukan hilang diam-diam dari pipeline),
+        dan baris EXITED tidak mencemari scan_history (rank=None di-filter)."""
+        cfg.raw.setdefault("state", {})["db_path"] = str(tmp_path / "mt.db")
+        st = open_state(cfg)
+        f = self._switching_fetcher(tmp_path)
+
+        out1 = run_scan(f, cfg, scfg, state=st, top_n=3)
+        syms1 = {r["symbol"] for r in out1.rows}
+        assert "XRP/IDR" in syms1 and len(out1.rows) == 3
+        assert all(r["rank"] is not None for r in out1.rows)
+
+        f.set_scan(2)                            # XRP delisted -> hilang
+        out2 = run_scan(f, cfg, scfg, state=st, top_n=3)
+        exited_rows = [r for r in out2.rows if r.get("status") == "EXITED"]
+        assert [r["symbol"] for r in exited_rows] == ["XRP/IDR"]
+        er = exited_rows[0]
+        assert er["rank_change"] == "EXITED" and er["rank"] is None
+        assert er["prev_rank"] is not None
+        assert out2.meta["exited"] == ["XRP/IDR"]
+        # render teks menampilkan Exit, bukan tabel rusak
+        txt = format_scan_text(out2)
+        assert "XRP/IDR" in txt.split("Keluar top-N")[1]
+
+        # persistensi hanya baris ranked; row EXITED tidak masuk scan_history
+        last = st.get_last_scan()
+        assert last["ts_utc"] == out2.ts_utc
+        assert all(r["rank"] is not None for r in last["rows"])
+        assert "XRP/IDR" not in {r["symbol"] for r in last["rows"]}
+        # tapi tetap tercatat di bot_state utk audit
+        assert st.get_bot_state("last_scan")["exited"] == ["XRP/IDR"]
+
+        # konsistensi semantik: compare_rank (state.py) memakai status yang sama.
+        # XRP/IDR ada di scan#1 tersimpan dan hilang di scan#2 -> "EXITED"
+        # (bukan "ABSENT": ABSENT hanya utk simbol yang tak pernah muncul).
+        cmp_xrp = st.compare_rank("XRP/IDR")
+        assert cmp_xrp["status"] == "EXITED"
+        assert cmp_xrp["current_rank"] is None and cmp_xrp["previous_rank"] is not None
 
     def test_errors_do_not_crash_scan(self, cfg, scfg, tmp_path):
         cfg.raw.setdefault("state", {})["db_path"] = str(tmp_path / "mt.db")
