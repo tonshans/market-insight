@@ -189,7 +189,25 @@ class MarketDataFetcher:
     # ----------------------------------------------------------------- markets
     def load_markets(self, force: bool = False) -> dict:
         if self._markets is None or force:
-            self._markets = self.get_exchange().load_markets()
+            mkts = self.get_exchange().load_markets()
+            # Beberapa exchange (mis. indodax via ccxt) TIDAK mengisi
+            # quoteVolume di load_markets -> universe filter akan membuang
+            # semua pair saat min_quote_volume_24h > 0. Kaya dengan satu
+            # panggilan fetch_tickers() hemat-rate-limit; kegagalan di sini
+            # tidak fatal (qvol dianggap 0 -> fallback max_symbols per likuiditas
+            # tetap jalan karena build_universe memakai nilai info/quoteVolume).
+            try:
+                if getattr(self.get_exchange(), "has", {}).get("fetchTickers"):
+                    tickers = self.get_exchange().fetch_tickers()
+                    for sym, t in (tickers or {}).items():
+                        if sym in mkts and isinstance(t, dict):
+                            qv = t.get("quoteVolume")
+                            if qv is not None and not mkts[sym].get("quoteVolume"):
+                                mkts[sym]["quoteVolume"] = qv
+            except Exception as exc:
+                logger.warning("fetch_tickers untuk qvol gagal (%s); "
+                               "universe tanpa filter volume.", type(exc).__name__)
+            self._markets = mkts
         return self._markets
 
     # ------------------------------------------------------------------- fetch
