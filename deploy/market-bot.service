@@ -1,0 +1,31 @@
+# systemd unit — Telegram bot Market Tools di Raspberry Pi (ARCHITECTURE.md §6)
+# Install sbg user service:
+#   mkdir -p ~/.config/systemd/user
+#   cp deploy/market-bot.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now market-bot.service
+#   journalctl --user -u market-bot -f
+[Unit]
+Description=Market Tools Telegram Bot (WP8)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Ganti /home/pi/market-tools sesuai lokasi repo
+WorkingDirectory=/home/pi/market-tools
+ExecStart=/usr/bin/python3 /home/pi/market-tools/bot.py
+Restart=on-failure
+RestartSec=10
+# Hardening ringan (PRD §6: ProtectSystem=full utk RPi)
+ProtectSystem=full
+ProtectHome=read-only
+# Bot butuh tulis cache/, state/, logs/ → berikan akses via ReadWritePaths
+ReadWritePaths=/home/pi/market-tools/cache /home/pi/market-tools/state /home/pi/market-tools/logs
+NoNewPrivileges=true
+PrivateTmp=true
+Environment=PYTHONUNBUFFERED=1
+# bot.yaml dimuat dari WorkingDirectory; pastikan permission 600
+
+[Install]
+WantedBy=default.target

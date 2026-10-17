@@ -1,0 +1,23 @@
+# =============================================================
+# Market Tools — Telegram Bot Config (WP8, F6/FR-5)
+# SALIN file ini menjadi `bot.yaml` lalu isi token & chat_id Anda.
+#   cp bot.yaml.example bot.yaml
+# `bot.yaml` sudah masuk .gitignore (NFR-4 — JANGAN pernah commit yang asli!)
+# =============================================================
+
+# Token dari @BotFather
+telegram_token: "GANTI_DENGAN_TOKEN_BOT"
+
+# Whitelist chat_id wajib (FR-5/NFR-4). Hanya chat di daftar ini dilayani;
+# chat lain dibungkam total. Cari chat_id Anda via @userinfobot.
+allowed_chat_ids:
+  - 111111111
+
+# Rate limit perintah per menit per chat (FR-5, default 10)
+rate_limit_per_minute: 10
+
+# Anti-spam notifikasi API_COOLDOWN: maksimal 1x per N menit per chat
+notify_cooldown_minutes: 15
+
+# Tampilkan emoji pada output text (default true)
+emoji: true
