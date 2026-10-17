@@ -40,17 +40,17 @@ def _deep_merge(base: dict, override: dict) -> dict:
             out[key] = value
         elif isinstance(value, str) and "." in key:
             # dotted key dalam override dict -> expand ke nested dict.
-            # Heuristik prefix CLI (FR-1): key "scanner.ranking.top_n" bisa
-            # berarti (a) cabang scanner.* DI DALAM file ini, atau (b) path
-            # relatif terhadap file target (scanner.yaml top-level = ranking).
-            # Pilih interpretasi yang cocok dgn struktur file; kalau tidak ada,
-            # pakai bentuk nested penuh (buat cabang baru).
+            # Heuristik prefix CLI (FR-1): "scanner.ranking.top_n" bisa berarti
+            # (a) cabang scanner.* DI DALAM file ini, atau (b) path relatif thd
+            # file target (scanner.yaml top-level = ranking). Pilih bentuk yang
+            # paling cocok dgn struktur file; kalau sama-sama belum ada, pakai
+            # bentuk penuh.
             parts = key.split(".")
-            if len(parts) > 1 and all(
-                    not isinstance(out.get(p), dict) for p in parts[:-1]):
-                # tidak ada bagian awal yang berupa dict di file -> perlakukan
-                # sebagai sub-path dari kunci pertama (buang prefix)
-                parts = parts[1:]
+            if len(parts) > 2:
+                full_ok = _path_exists(out, parts)
+                stripped_ok = _path_exists(out, parts[1:])
+                if stripped_ok and not full_ok:
+                    parts = parts[1:]
             node = out
             for p in parts[:-1]:
                 nxt = node.get(p)
@@ -64,6 +64,16 @@ def _deep_merge(base: dict, override: dict) -> dict:
         else:
             out[key] = copy.deepcopy(value)
     return out
+
+
+def _path_exists(node: dict, parts: list[str]) -> bool:
+    """True bila seluruh jalur `parts` sudah ada di `node` (dict bersarang)."""
+    cur: Any = node
+    for p in parts:
+        if not isinstance(cur, dict) or p not in cur:
+            return False
+        cur = cur[p]
+    return True
 
 
 def _coerce_scalar(s: str):
