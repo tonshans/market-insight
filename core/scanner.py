@@ -322,7 +322,10 @@ def run_scan(fetcher, config, scanner_config, state=None,
 
     # 3+4. analisa & skor per kandidat ------------------------------------------
     rows: list[dict[str, Any]] = []
-    for sym in candidates:
+    n_cand = len(candidates)
+    for ci, sym in enumerate(candidates, 1):
+        if progress:
+            progress(ci, n_cand, f"{sym} (scoring {ci}/{n_cand})")
         df_base = prefetched[sym]
         extras: dict[str, pd.DataFrame] = {}
         for tf in conf_tf:

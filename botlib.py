@@ -161,6 +161,67 @@ HELP_TEXT = """🤖 Market Tools — Fase 1 (Observasi)
 Hanya chat_id terdaftar (whitelist) yang dilayani; maks 10 perintah/menit."""
 
 
+# ------------------------------------------------------------ progress bar
+def render_progress(done: int, total: int, label: str = "", width: int = 18,
+                    eta_seconds: Optional[float] = None) -> str:
+    """Render satu baris progress text (dipakai CLI & Telegram).
+
+    Contoh: ``⏳ [██████░░░░░░░░░░░░] 6/18 (33%)  XRP/IDR  ETA 02:15``
+    """
+    total = max(1, int(total))
+    done = min(max(0, int(done)), total)
+    filled = round(width * done / total)
+    bar = "█" * filled + "░" * (width - filled)
+    pct = 100 * done // total
+    line = f"⏳ [{bar}] {done}/{total} ({pct}%)"
+    if label:
+        line += f"  {label[:40]}"
+    if eta_seconds is not None and eta_seconds >= 0:
+        m, s = divmod(int(eta_seconds), 60)
+        line += f"  ETA {m:02d}:{s:02d}"
+    return line
+
+
+class ProgressThrottle:
+    """Rate-limiter update pesan progress (Telegram flood-limit ~1 edit/detik/chat).
+
+    `throttle` detik minimum antar callback; callback dipanggil dengan
+    ``(done, total, label)`` — signature sama dengan `progress` di
+    core.scanner.run_scan. Bila `max_len` diberikan, label panjang (daftar
+    simbol yang sudah diproses) dipotong dari depan agar muat 1 baris chat.
+    """
+
+    def __init__(self, callback: Callable[[int, int, str], None],
+                 throttle_seconds: float = 1.0, clock: Callable[[], float] = time.monotonic,
+                 max_len: int = 0):
+        self.callback = callback
+        self.throttle_seconds = float(throttle_seconds)
+        self.clock = clock
+        self.max_len = int(max_len)
+        self._last_emit: Optional[float] = None
+
+    def _emit(self, done: int, total: int, label: str) -> None:
+        if self.max_len and len(label) > self.max_len:
+            label = "…" + label[-(self.max_len - 1):]
+        self.callback(done, total, label)
+
+    def __call__(self, done: int, total: int, label: str = "") -> bool:
+        """Return True bila callback benar-benar dipanggil (untuk test/logika)."""
+        t = self.clock()
+        if (self._last_emit is not None
+                and t - self._last_emit < self.throttle_seconds
+                and done != total):          # progres penuh: selalu emit
+            return False
+        self._last_emit = t
+        self._emit(done, total, label)
+        return True
+
+    def finish(self, done: int, total: int, label: str = "") -> None:
+        """Emit final tanpa memedulikan throttle (mis. 'selesai')."""
+        self._last_emit = self.clock()
+        self._emit(done, total, label)
+
+
 # ---------------------------------------------------------------- engine
 @dataclass
 class BotEngine:
@@ -178,6 +239,7 @@ class BotEngine:
     format_scan_fn: Optional[Callable[..., str]] = None    # core.scanner.format_scan_text
     emoji: bool = True
     chunk_limit: int = TELEGRAM_LIMIT
+    progress_enabled: bool = True        # bot.yaml: progress: false utk mematikan
 
     def __post_init__(self):
         if self.config is None:
@@ -299,7 +361,10 @@ class BotEngine:
                 msgs.append(n)
         return msgs
 
-    def cmd_scan(self, chat_id: Any, args: list[str]) -> list[str]:
+    def cmd_scan(self, chat_id: Any, args: list[str],
+                 progress_cb: Optional[Callable[[str], None]] = None) -> list[str]:
+        """Jalankan scanner. `progress_cb` (opsional) dipakai adapter bot.py utk
+        meng-edit pesan progres di Telegram; engine tetap murni/tanpa I/O."""
         # Parser satu-pass menjaga urutan & pasangan flag-nilai:
         # "/scan --watchlist --limit 5 --top 3" tidak boleh menyisakan
         # angka posisi yang salah dianggap argumen tak dikenal.
@@ -340,11 +405,45 @@ class BotEngine:
             kwargs["top_n"] = opts["top"]
         state = None if "--no-save" in flags else self.get_state()
 
+        # progress bar (PRD F6) — engine murni: hanya panggil progress_cb bila
+        # adapter menyuplainya; throttle + ETA dihitung di sini, I/O di bot.py.
+        scan_progress = None
+        if progress_cb is not None and self.progress_enabled:
+            import time as _t
+            seen_syms: list[str] = []
+            t0 = _t.monotonic()
+
+            def on_scan_progress(done: int, total: int, label: str) -> None:
+                phase = ("Pre-filter ADX" if "(ADX)" in label
+                         else "Scoring")
+                base = label.split(" (")[0] if "(ADX)" in label else \
+                    label.split(" (")[0].strip()
+                if base and (not seen_syms or seen_syms[-1] != base):
+                    seen_syms.append(base)
+                eta = None
+                if done > 0:
+                    elapsed = _t.monotonic() - t0
+                    eta = max(0.0, (elapsed / done) * (total - done))
+                tail = ", ".join(seen_syms[-4:]) if seen_syms else ""
+                line = render_progress(done, total, f"{phase}: {tail}",
+                                       eta_seconds=eta)
+                if len(line) > self.chunk_limit:
+                    line = line[:self.chunk_limit]
+                progress_cb(line)
+
+            scan_progress = ProgressThrottle(on_scan_progress,
+                                             throttle_seconds=1.0)
+
         try:
             outcome = self.scanner_run(self.get_fetcher(), self.config,
-                                       self.scanner_config, state=state, **kwargs)
+                                       self.scanner_config, state=state,
+                                       progress=scan_progress, **kwargs)
         except Exception as e:
             return [f"❌ Scan gagal: {_fmt_exc(e)}"]
+
+        if scan_progress is not None:
+            scan_progress.finish(outcome.analysed_size, outcome.analysed_size,
+                                 "selesai — menyusun hasil")
 
         text = self.scan_formatter(outcome, emoji=self.emoji)
         msgs = chunk_message(text, self.chunk_limit)
@@ -431,13 +530,15 @@ class BotEngine:
         return chunk_message("\n".join(lines), self.chunk_limit)
 
     # -------------------------------------------------------------- router
-    def handle_update(self, chat_id: Any, text: str) -> list[str]:
+    def handle_update(self, chat_id: Any, text: str,
+                      progress_cb: Optional[Callable[[str], None]] = None) -> list[str]:
         """Satu update -> daftar pesan balas (sudah di-chunk).
 
         Guard berurutan: whitelist (wajib) → parse command → rate limit →
         dispatch. Tidak pernah raise untuk error input user; hanya
         BotAuthError yang dilempar utk chat asing (caller hrs memutuskan
-        apakah diam atau logging).
+        apakah diam atau logging). `progress_cb` diteruskan ke /scan (progress
+        bar Telegram; PRD F6).
         """
         self.assert_whitelisted(chat_id)
         parts = (text or "").strip().split()
@@ -461,6 +562,8 @@ class BotEngine:
         fn = dispatch.get(cmd)
         if fn is None:
             return [f"❓ Perintah tidak dikenal: {cmd}\nKetik /help utk bantuan."]
+        if cmd == "/scan":
+            return fn(chat_id, args, progress_cb=progress_cb)
         return fn(chat_id, args)
 
 
@@ -478,4 +581,5 @@ def build_engine(bot_cfg: dict[str, Any], config_path: str = "config.yaml",
         rate_limit_per_minute=int(bot_cfg.get("rate_limit_per_minute", 10)),
         notify_cooldown_seconds=notify_min * 60.0,
         emoji=bool(bot_cfg.get("emoji", True)),
+        progress_enabled=bool(bot_cfg.get("progress", True)),
     )

@@ -465,3 +465,79 @@ class TestBotAdapter:
             effective_message=Msg())
         asyncio.run(handler(update, types.SimpleNamespace(args=[])))
         assert sent == []  # chat asing dibungkam total
+
+
+# ------------------------------------------------------- progress bar (F6)
+class TestProgressBar:
+    def test_render_progress_format(self):
+        s = botlib.render_progress(6, 18, "Pre-filter ADX", eta_seconds=135)
+        assert s.startswith("⏳ [") and "6/18 (33%)" in s and "ETA 02:15" in s
+        assert "█" in s and "░" in s
+        # clamp aman utk input liar
+        assert "0/1 (0%)" in botlib.render_progress(-5, 1)
+        assert "1/1 (100%)" in botlib.render_progress(99, 1)
+
+    def test_throttle_emits_first_and_last_only(self):
+        seen = []
+        clock = {"t": 0.0}
+        th = botlib.ProgressThrottle(lambda d, t, l: seen.append((d, t, l)),
+                                     throttle_seconds=1.0,
+                                     clock=lambda: clock["t"])
+        assert th(1, 10, "a") is True          # emit pertama
+        clock["t"] = 0.2
+        assert th(2, 10, "b") is False         # terlalu cepat -> skip
+        assert th(10, 10, "z") is True         # done==total -> selalu emit
+        clock["t"] = 5.0
+        assert th(4, 10, "c") is True          # jendela lewat -> emit
+        th.finish(10, 10, "selesai")           # finish menembus throttle
+        assert seen[-1] == (10, 10, "selesai")
+
+    def test_cmd_scan_feeds_progress_cb(self, tmp_path):
+        updates = []
+
+        def fake_run(fetcher, config, scfg, state=None, progress=None, **kw):
+            if progress:
+                progress(1, 2, "BTC/IDR (ADX)")
+                progress(2, 2, "ETH/IDR (ADX)")
+                progress(1, 1, "BTC/IDR (scoring 1/1)")
+            return _outcome()
+
+        engine, _ = _mk_engine(tmp_path, run_scan_fn=fake_run)
+        msgs = engine.cmd_scan(111, [], progress_cb=updates.append)
+        assert msgs and "SCAN RESULT" in msgs[0]
+        assert updates, "progress_cb harus menerima update"
+        assert all(u.startswith("⏳ [") for u in updates)
+        assert "Pre-filter ADX" in updates[0]
+        assert "Scoring" in updates[-1] or "selesai" in updates[-1]
+
+    def test_cmd_scan_without_cb_unchanged(self, tmp_path):
+        # kontrak lama: call site tanpa progress tetap jalan (regresi guard)
+        engine, _ = _mk_engine(tmp_path, run_scan_fn=lambda *a, **k: _outcome())
+        msgs = engine.handle_update(111, "/scan")
+        assert msgs and "SCAN RESULT" in msgs[0]
+
+    def test_progress_disabled_flag(self, tmp_path):
+        captured = {}
+
+        def fake_run(fetcher, config, scfg, state=None, progress=None, **kw):
+            captured["progress"] = progress
+            return _outcome()
+
+        engine, _ = _mk_engine(tmp_path, run_scan_fn=fake_run)
+        engine.progress_enabled = False
+        updates = []
+        engine.cmd_scan(111, [], progress_cb=updates.append)
+        assert captured["progress"] is None and updates == []
+
+    def test_handle_update_forwards_progress_to_scan(self, tmp_path):
+        got = {}
+
+        def cmd(chat_id, args, progress_cb=None):
+            got["cb"] = progress_cb
+            return ["ok"]
+
+        engine, _ = _mk_engine(tmp_path)
+        engine.cmd_scan = cmd
+        msgs = engine.handle_update(111, "/scan", progress_cb=lambda s: None)
+        assert msgs == ["ok"] and got["cb"] is not None
+        engine.handle_update(111, "/watch")   # perintah lain: tidak perlu cb

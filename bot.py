@@ -28,6 +28,7 @@ import asyncio
 import logging
 import os
 import sys
+import time
 from logging.handlers import RotatingFileHandler
 
 import botlib
@@ -63,15 +64,31 @@ def _sync_handler(engine: BotEngine):
         first_word = original.split(maxsplit=1)[0] if original else ""
         full_cmd = (f"{first_word} " + " ".join(context.args or [])).strip() \
             if first_word else ""
+
+        # Progress bar utk /scan (PRD F6): kirim 1 pesan, engine meng-edit via
+        # update_sync (thread-safe, di-throttle). Non-scan: tanpa progres.
+        pm = None
+        progress_cb = None
+        is_scan = first_word.lower().split("@", 1)[0] == "/scan"
+        if is_scan and engine.progress_enabled:
+            pm = ProgressMessenger(update.effective_message)
+            await pm.start("⏳ Scan dimulai…")
+            progress_cb = pm.update_sync
+
         try:
             messages = await asyncio.to_thread(engine.handle_update,
-                                               chat_id, full_cmd)
+                                               chat_id, full_cmd,
+                                               progress_cb)
         except BotAuthError as e:
             logger.warning("akses ditolak: %s", e)
+            if pm is not None:
+                await pm.finish()
             return  # chat asing: diam — jangan beri informasi apa pun (NFR-4)
         except Exception as e:  # jangan pernah matikan worker/polling
             logger.exception("handler error: %s", e)
             messages = [f"❌ Error internal: {e}"]
+        if pm is not None:
+            await pm.finish()
         for i, msg in enumerate(messages):
             await update.effective_message.reply_text(msg)
             if len(messages) > 1 and i < len(messages) - 1:
@@ -173,6 +190,61 @@ def _fmt(e: Exception) -> str:
     if cause is not None and str(cause):
         return f"{e} [{type(cause).__name__}: {cause}]"
     return str(e)
+
+
+class ProgressMessenger:
+    """Progress bar Telegram utk /scan: kirim 1 pesan, lalu di-edit berulang.
+
+    Thread-safe utk dipanggil dari worker `asyncio.to_thread` (engine sinkron):
+    update dikirim ke loop utama via `asyncio.run_coroutine_threadsafe`, dan
+    di-throttle ~1 edit/detik (flood-limit Telegram aman). Kegagalan kirim/edit
+    (chat diblokir, hiccup network) hanya mematikan progres — scan & hasil
+    akhir tetap jalan.
+    """
+
+    def __init__(self, message, throttle_seconds: float = 1.0):
+        self.message = message          # telegram.Message
+        self.throttle_seconds = throttle_seconds
+        self.broken = False
+        self._last_edit: float | None = None
+        self._loop = asyncio.get_running_loop()
+
+    async def start(self, text: str = "⏳ Scan dimulai…") -> None:
+        try:
+            await self.message.reply_text(text)
+        except Exception:
+            self.broken = True
+
+    def update_sync(self, text: str) -> None:
+        """Dipanggil dari worker thread (progress_cb engine). Non-blocking."""
+        if self.broken:
+            return
+        now = time.monotonic()
+        if (self._last_edit is not None
+                and now - self._last_edit < self.throttle_seconds):
+            return
+        self._last_edit = now
+        try:
+            asyncio.run_coroutine_threadsafe(self._edit(text), self._loop)
+        except Exception:
+            self.broken = True
+
+    async def _edit(self, text: str) -> None:
+        try:
+            await self.message.edit_text(text[:4096])
+        except Exception as e:
+            # "message is not modified" bukan masalah; kegagalan lain: matikan progres
+            if "not modified" not in str(e).lower():
+                self.broken = True
+
+    async def finish(self, final_text: str | None = None) -> None:
+        """Edit ke pesan 'selesai' (default) — jangan hapus agar riwayat terbaca."""
+        if self.broken:
+            return
+        try:
+            await self.message.edit_text((final_text or "✅ Scan selesai.")[:4096])
+        except Exception:
+            pass  # pesan progres nice-to-have; jangan ganggu hasil utama
 
 
 if __name__ == "__main__":
