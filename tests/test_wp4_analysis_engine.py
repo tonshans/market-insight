@@ -224,6 +224,33 @@ def test_rr_auto_long():
                                     / (rr["entry"] - rr["stop"]), 2)) < 0.01
 
 
+def test_rr_atr_fallback_does_not_clobber_stop():
+    """Regresi bug: di jalur fallback ATR-projection, variabel stop (`s`)
+    pernah ditimpa oleh nilai ATR sehingga risk/reward & verdict salah total.
+
+    Stop harus tetap sama dengan invalidation; hanya target yang diproyeksikan.
+    """
+    n = 40
+    close = np.linspace(100.0, 110.0, n)
+    df = pd.DataFrame({
+        "ts": pd.date_range("2026-01-01", periods=n, tz="UTC", freq="h"),
+        "open": close, "high": close + 0.5, "low": close - 0.5,
+        "close": close, "volume": [1000.0] * n,
+    })
+    from core import indicators as ind
+    atr_last = float(ind.atr(df, 14).iloc[-1])
+    sr_out = {"resistances": [], "supports": [{"level": 100.0}],
+              "atr_period": 14, "fallback_atr_multiple": 2.0}
+    price, invalidation = 110.0, 108.0
+    rr = rr_mod.compute_rr("LONG", price, invalidation, sr_out, df=df)
+    assert rr["stop"] == invalidation          # stop TIDAK boleh jadi ATR
+    assert rr["target_source"] == "ATR_PROJECTION"
+    assert rr["target"] == round(price + 2.0 * atr_last, 8)
+    assert rr["risk_abs"] == round(price - invalidation, 8)
+    assert rr["rr"] == round((price + 2.0 * atr_last - price)
+                             / (price - invalidation), 2)
+
+
 def test_rr_manual_and_neutral():
     sr_out = {"supports": [{"level": 90.0}], "resistances": [{"level": 120.0}]}
     rr = rr_mod.compute_rr("LONG", 100.0, None, sr_out, mode="manual",

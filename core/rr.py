@@ -66,8 +66,8 @@ def compute_rr(direction: str, price: float, invalidation: float | None,
             atr_period = int(sr.get("atr_period", 14))
             a = None
             if df is not None and len(df) >= atr_period + 1:
-                s = ta.atr(df, atr_period).iloc[-1]
-                a = float(s) if pd.notna(s) else None
+                atr_val = ta.atr(df, atr_period).iloc[-1]
+                a = float(atr_val) if pd.notna(atr_val) else None
             if a is None or a <= 0:
                 return out
             proj = float(sr.get("fallback_atr_multiple", 2.0))

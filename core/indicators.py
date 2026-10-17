@@ -43,7 +43,15 @@ def rsi(close: pd.Series, period: int = 14) -> pd.Series:
     avg_loss = loss.ewm(alpha=1 / period, adjust=False).mean()
     rs = avg_gain / avg_loss.replace(0.0, np.nan)
     out = 100 - (100 / (1 + rs))
-    return out.fillna(100.0).where(avg_loss.notna(), np.nan)
+    # Kasus khusus: avg_loss == 0 (tidak ada penurunan sama sekali).
+    # - avg_gain > 0  -> RSI = 100 (uptrend murni).
+    # - avg_gain == 0 -> harga flat/sideways; RSI klasik didefinisikan 50
+    #   (netral), BUKAN 100. Mengembalikan 100 di sini memicu vote bullish
+    #   palsu pada data sideways.
+    no_loss = avg_loss == 0
+    out = out.mask(no_loss & (avg_gain == 0), 50.0)
+    out = out.mask(no_loss & (avg_gain > 0), 100.0)
+    return out.where(avg_gain.notna() | avg_loss.notna(), np.nan)
 
 
 def macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:

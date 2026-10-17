@@ -105,6 +105,21 @@ def test_ema_sma_rsi():
     assert 0 <= last_r <= 100
 
 
+def test_rsi_flat_prices_is_neutral_not_100():
+    """Regresi: harga flat (sideways) harus RSI 50 (netral), bukan 100.
+
+    Nilai 100 pada data sideways memicu vote bullish palsu di engine.
+    """
+    flat = pd.Series([100.0] * 30)
+    r = ind.rsi(flat, 14)
+    assert not np.isnan(r.iloc[-1])
+    assert r.iloc[-1] == pytest.approx(50.0)
+
+    # Uptrend murni (tanpa loss, tapi ada gain) tetap 100.
+    up = pd.Series(np.arange(1.0, 40.0))
+    assert ind.rsi(up, 14).iloc[-1] == pytest.approx(100.0)
+
+
 def test_macd_atr_adx():
     df = _sample_df()
     m = ind.macd(df["close"])
