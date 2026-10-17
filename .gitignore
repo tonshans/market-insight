@@ -1,0 +1,24 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Secrets & runtime state (NFR-4: bot.yaml MUST NOT be committed)
+bot.yaml
+config.local.yaml
+
+# Generated data directories
+cache/
+state/
+logs/
+*.db
+*.db-wal
+*.db-shm
+*.parquet
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/

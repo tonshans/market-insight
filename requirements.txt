@@ -1,0 +1,9 @@
+# Market Tools - Fase 1 (Observasi)
+# Target: Python 3.10+ (Raspberry Pi 4, 4GB RAM)
+ccxt>=4.0.0          # exchange adapter (Indodax dll)
+pandas>=2.0.0        # OHLCV dataframe
+numpy>=1.24.0        # numerics (indicators)
+pyarrow>=14.0.0      # parquet cache backend
+PyYAML>=6.0          # config & watchlist
+python-telegram-bot>=20.0   # Telegram bot (WP8)
+requests>=2.31.0     # error classes utk circuit breaker

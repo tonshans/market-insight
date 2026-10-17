@@ -1,0 +1,31 @@
+# =============================================================
+# Market Tools - Konfigurasi Scanner (F3, FR-4)
+# =============================================================
+universe:
+  quote_currency: IDR       # hanya pair ber-quote IDR di Indodax
+  exclude_bases: [USDT, USDC, BUSD, TUSD, FDUSD]  # stablecoin base
+  min_quote_volume_24h: 500000000   # 500 juta IDR / 24h (likuiditas minimum)
+  max_symbols: 200                  # batas hard utk melindungi RPi
+
+prefilter:
+  adx_period: 14
+  min_adx: 15                 # buang pair yang benar-benar tanpa trend
+  timeframe: 4h               # TF acuan pre-filter
+
+scoring:                      # bobot prospect score (0..100)
+  weights:
+    trend_strength: 0.35      # |trend_score_raw| tertinggi antar TF
+    confluence: 0.25          # kesepakatan arah antar TF
+    momentum: 0.15            # MACD histogram / LR slope
+    volume: 0.15              # vsa_score + wick_rejection
+    risk_reward: 0.10         # potensi R:R dari setup saat ini
+  risk_weights:
+    atr_pct: 0.5              # volatilitas relatif thd harga
+    distance_to_sr: 0.3       # jarak ke support terdekat
+    liquidity: 0.2            # quote volume relatif
+
+ranking:
+  formula: adj_score = prospect - (risk * risk_penalty)
+  risk_penalty: 0.5
+  top_n: 15                   # jumlah hasil ditampilkan
+  persist_history: true       # simpan ke scan_history (SQLite)
