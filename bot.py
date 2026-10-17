@@ -91,7 +91,21 @@ def register_handlers(app, engine: BotEngine) -> None:
 
 def _cmd(name: str, callback):
     from telegram.ext import CommandHandler
-    return CommandHandler(name, callback)
+
+    class _NamedCommandHandler(CommandHandler):
+        """CommandHandler + atribut `command` eksplisit utk inspeksi/test.
+
+        PTB memakai __slots__ (tanpa __dict__), jadi nama tidak bisa di-set
+        sebagai atribt biasa; subclass kecil menghindari ketergantungan pada
+        atribut internal (`commands`) yang bisa berubah antar versi PTB.
+        """
+        __slots__ = ("command",)
+
+        def __init__(self, command_name, cb):
+            super().__init__(command_name, cb)
+            self.command = command_name
+
+    return _NamedCommandHandler(name, callback)
 
 
 async def on_error(update, context) -> None:

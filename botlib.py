@@ -259,14 +259,13 @@ class BotEngine:
                     "contoh: /insight BTC/IDR 1h 4h 1d 2"]
         symbol_raw = args[0]
         level = 1
-        tfs: list[str] = []
-        for a in args[1:]:
-            # angka "1"/"2" hanya dianggap level selama belum ada TF;
-            # setelah TF pertama, token berikutnya selalu TF (mis. "2h")
-            if a.isdigit() and a in ("1", "2") and not tfs:
-                level = int(a)
-            else:
-                tfs.append(a)
+        rest = args[1:]
+        # Level (1|2) dibaca dari token TERAKHIR — "/insight BTC/IDR 2" dan
+        # "/insight eth/idr 1h 4h 2" sama-sama valid; token sisanya TF.
+        if rest and rest[-1] in ("1", "2"):
+            level = int(rest[-1])
+            rest = rest[:-1]
+        tfs: list[str] = list(rest)
         try:
             symbol = normalize_symbol(symbol_raw)
         except ValueError as e:
@@ -301,22 +300,28 @@ class BotEngine:
         return msgs
 
     def cmd_scan(self, chat_id: Any, args: list[str]) -> list[str]:
-        flags = {a.lower() for a in args}
-        unknown = flags - {"--watchlist", "-w", "--no-save", "--json"}
+        # Parser satu-pass menjaga urutan & pasangan flag-nilai:
+        # "/scan --watchlist --limit 5 --top 3" tidak boleh menyisakan
+        # angka posisi yang salah dianggap argumen tak dikenal.
+        known_flags = {"--watchlist", "-w", "--no-save", "--json"}
+        value_flags = ("--limit", "--top")
+        flags: set[str] = set()
         opts: dict[str, Any] = {}
-        rest = list(args)
-        for name in ("--limit", "--top"):
-            if name in rest:
-                i = rest.index(name)
+        i = 0
+        while i < len(args):
+            a = args[i].lower()
+            if a in known_flags:
+                flags.add(a)
+            elif a in value_flags:
                 try:
-                    opts[name[2:]] = int(rest[i + 1])
+                    opts[a[2:]] = int(args[i + 1])
                 except (IndexError, ValueError):
-                    return [f"❌ {name} butuh angka. contoh: /scan {name} 10"]
-                del rest[i:i + 2]
-        unknown |= {a for a in rest if a.startswith("-")} - {"--watchlist", "-w", "--no-save", "--json"}
-        if unknown:
-            return [f"❌ Argumen tidak dikenal: {' '.join(sorted(unknown))}\n"
-                    "Pakai: /scan [--watchlist] [--limit N] [--top N] [--no-save]"]
+                    return [f"❌ {a} butuh angka. contoh: /scan {a} 10"]
+                i += 1
+            else:
+                return [f"❌ Argumen tidak dikenal: {args[i]}\n"
+                        "Pakai: /scan [--watchlist] [--limit N] [--top N] [--no-save]"]
+            i += 1
 
         breaker = getattr(self.get_fetcher(), "breaker", None)
         if breaker is not None and breaker.in_cooldown:

@@ -138,7 +138,11 @@ class ParquetCache:
         for fname in os.listdir(self.cache_dir):
             if not fname.startswith(prefix):
                 continue
-            if fname.endswith(".parquet") or fname.endswith(".parquet.meta.json"):
+            # NB: ".parquet.meta.json" juga berakhiran ".json" — cek suffix
+            # meta DULU agar sidecar ikut terhapus (bug lama: 0 file terhapus).
+            if (fname.endswith(".parquet")
+                    or fname.endswith(".parquet.meta.json")
+                    or fname.endswith(".meta.json")):
                 try:
                     os.remove(os.path.join(self.cache_dir, fname))
                     removed += 1

@@ -39,8 +39,18 @@ def _deep_merge(base: dict, override: dict) -> dict:
                 value = value[1:]
             out[key] = value
         elif isinstance(value, str) and "." in key:
-            # dotted key dalam override dict -> expand ke nested dict
+            # dotted key dalam override dict -> expand ke nested dict.
+            # Heuristik prefix CLI (FR-1): key "scanner.ranking.top_n" bisa
+            # berarti (a) cabang scanner.* DI DALAM file ini, atau (b) path
+            # relatif terhadap file target (scanner.yaml top-level = ranking).
+            # Pilih interpretasi yang cocok dgn struktur file; kalau tidak ada,
+            # pakai bentuk nested penuh (buat cabang baru).
             parts = key.split(".")
+            if len(parts) > 1 and all(
+                    not isinstance(out.get(p), dict) for p in parts[:-1]):
+                # tidak ada bagian awal yang berupa dict di file -> perlakukan
+                # sebagai sub-path dari kunci pertama (buang prefix)
+                parts = parts[1:]
             node = out
             for p in parts[:-1]:
                 nxt = node.get(p)
